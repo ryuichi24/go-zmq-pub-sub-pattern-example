@@ -38,16 +38,12 @@ func main() {
 		// Create message with topic
 		message := fmt.Sprintf("%s: Message %d", topic, i)
 
-		// Send topic first, then message
-		_, err = publisher.Send(topic, zmq.SNDMORE)
+		// the first frame is reserved for the topic
+		frames := []string{topic, message}
+
+		_, err := publisher.SendMessage(frames)
 		if err != nil {
 			log.Printf("Failed to send topic: %v", err)
-			continue
-		}
-
-		_, err = publisher.Send(message, 0)
-		if err != nil {
-			log.Printf("Failed to send message: %v", err)
 			continue
 		}
 
