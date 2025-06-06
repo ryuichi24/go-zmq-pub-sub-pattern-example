@@ -72,26 +72,26 @@ jobs:
           cd vcpkg
           ./bootstrap-vcpkg.bat -disableMetrics
           ./vcpkg install zeromq:x64-windows
-          
+
           # Set up environment variables for CGO
           $vcpkgRoot = "${{ github.workspace }}/vcpkg"
           $installDir = "$vcpkgRoot/installed/x64-windows"
-          
+
           # Add pkg-config path
           $pkgConfigPath = "$installDir/lib/pkgconfig;$installDir/share/pkgconfig"
           Add-Content -Path $env:GITHUB_ENV -Value "PKG_CONFIG_PATH=$pkgConfigPath"
-          
+
           # Find the actual ZeroMQ library file dynamically
           $zmqLibs = Get-ChildItem -Path "$installDir/lib" -Filter "*zmq*.lib" | Where-Object { $_.Name -match "libzmq.*\.lib$" }
           if ($zmqLibs.Count -eq 0) {
             Write-Error "No ZeroMQ library found in $installDir/lib"
             exit 1
           }
-          
+
           # Use the first matching library (there should typically be only one)
           $zmqLibName = $zmqLibs[0].Name
           Write-Host "Found ZeroMQ library: $zmqLibName"
-          
+
           # Add CGO flags for ZeroMQ with dynamic library detection
           Add-Content -Path $env:GITHUB_ENV -Value "CGO_CFLAGS=-I$installDir/include"
           Add-Content -Path $env:GITHUB_ENV -Value "CGO_LDFLAGS=-L$installDir/lib -l:$zmqLibName"
@@ -107,9 +107,19 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path artifacts
-          # Copy executables and dependencies for Windows
+
+          # Copy Go executables
           Copy-Item -Path "dist/pub.exe" -Destination "artifacts/pub-${{ matrix.goos }}-${{ matrix.arch }}.exe" -Force
           Copy-Item -Path "dist/sub.exe" -Destination "artifacts/sub-${{ matrix.goos }}-${{ matrix.arch }}.exe" -Force
+
+          # Locate and copy libzmq.dll
+          $dllPath = Get-ChildItem -Path "${{ github.workspace }}/vcpkg/installed/x64-windows/bin" -Filter "libzmq*.dll" | Select-Object -First 1
+          if (-Not $dllPath) {
+            Write-Error "libzmq DLL not found!"
+            exit 1
+          }
+
+          Copy-Item -Path $dllPath.FullName -Destination "artifacts/" -Forcee
 
       - name: Prepare artifacts (Unix)
         if: matrix.goos != 'windows'
@@ -141,10 +151,10 @@ jobs:
           script: |
             const fs = require('fs').promises;
             const path = require('path');
-            
+
             // Get the tag name from the GitHub ref
             const tagName = context.ref.replace('refs/tags/', '');
-            
+
             // Create the release
             const release = await github.rest.repos.createRelease({
               owner: context.repo.owner,
@@ -175,7 +185,7 @@ jobs:
             // Upload all artifacts
             const artifactsDir = path.resolve(process.env.GITHUB_WORKSPACE, 'artifacts');
             const files = await getFiles(artifactsDir);
-            
+
             for (const filePath of files) {
               const content = await fs.readFile(filePath);
               const fileName = path.basename(filePath);
