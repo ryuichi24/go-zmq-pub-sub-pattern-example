@@ -13,22 +13,20 @@ jobs:
     strategy:
       matrix:
         include:
-          # Linux builds
           - runner: ubuntu-latest
             goos: linux
             arch: amd64
             docker_platform: linux/amd64
-          # macOS builds (native)
           - runner: macos-13
             goos: darwin
             arch: amd64
           - runner: macos-14
             goos: darwin
             arch: arm64
-          # Windows builds
           - runner: windows-latest
             goos: windows
             arch: amd64
+
     runs-on: ${{ matrix.runner }}
 
     steps:
@@ -40,7 +38,7 @@ jobs:
         with:
           go-version: "1.24.3"
 
-      - name: Install ZeroMQ (macOS or linux)
+      - name: Install ZeroMQ (macOS or Linux)
         if: matrix.goos == 'darwin' || matrix.goos == 'linux'
         env:
           VCPKG_DISABLE_METRICS: 1
@@ -48,7 +46,6 @@ jobs:
           git clone https://github.com/microsoft/vcpkg.git
           cd vcpkg
           ./bootstrap-vcpkg.sh
-          # Set triplet based on OS and architecture
           if [ "${{ matrix.goos }}" = "darwin" ]; then
             if [ "${{ matrix.arch }}" = "arm64" ]; then
               triplet="arm64-osx"
@@ -67,32 +64,22 @@ jobs:
           VCPKG_DISABLE_METRICS: 1
         shell: pwsh
         run: |
-          # Install ZeroMQ
           git clone https://github.com/microsoft/vcpkg.git
           cd vcpkg
           ./bootstrap-vcpkg.bat -disableMetrics
           ./vcpkg install zeromq:x64-windows
 
-          # Set up environment variables for CGO
           $vcpkgRoot = "${{ github.workspace }}/vcpkg"
           $installDir = "$vcpkgRoot/installed/x64-windows"
-
-          # Add pkg-config path
           $pkgConfigPath = "$installDir/lib/pkgconfig;$installDir/share/pkgconfig"
           Add-Content -Path $env:GITHUB_ENV -Value "PKG_CONFIG_PATH=$pkgConfigPath"
 
-          # Find the actual ZeroMQ library file dynamically
           $zmqLibs = Get-ChildItem -Path "$installDir/lib" -Filter "*zmq*.lib" | Where-Object { $_.Name -match "libzmq.*\.lib$" }
           if ($zmqLibs.Count -eq 0) {
             Write-Error "No ZeroMQ library found in $installDir/lib"
             exit 1
           }
-
-          # Use the first matching library (there should typically be only one)
           $zmqLibName = $zmqLibs[0].Name
-          Write-Host "Found ZeroMQ library: $zmqLibName"
-
-          # Add CGO flags for ZeroMQ with dynamic library detection
           Add-Content -Path $env:GITHUB_ENV -Value "CGO_CFLAGS=-I$installDir/include"
           Add-Content -Path $env:GITHUB_ENV -Value "CGO_LDFLAGS=-L$installDir/lib -l:$zmqLibName"
 
@@ -101,39 +88,36 @@ jobs:
           make build-pub
           make build-sub
 
-      # Prepare artifacts
       - name: Prepare artifacts (Windows)
         if: matrix.goos == 'windows'
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force -Path artifacts
+          $outDir = "artifacts/${{ matrix.goos }}-${{ matrix.arch }}"
+          New-Item -ItemType Directory -Force -Path $outDir
+          Copy-Item -Path "dist/pub.exe" -Destination "$outDir/pub.exe" -Force
+          Copy-Item -Path "dist/sub.exe" -Destination "$outDir/sub.exe" -Force
 
-          # Copy Go executables
-          Copy-Item -Path "dist/pub.exe" -Destination "artifacts/pub-${{ matrix.goos }}-${{ matrix.arch }}.exe" -Force
-          Copy-Item -Path "dist/sub.exe" -Destination "artifacts/sub-${{ matrix.goos }}-${{ matrix.arch }}.exe" -Force
-
-          # Locate and copy libzmq.dll
           $dllPath = Get-ChildItem -Path "${{ github.workspace }}/vcpkg/installed/x64-windows/bin" -Filter "libzmq*.dll" | Select-Object -First 1
           if (-Not $dllPath) {
             Write-Error "libzmq DLL not found!"
             exit 1
           }
-
-          Copy-Item -Path $dllPath.FullName -Destination "artifacts/" -Force
+          Copy-Item -Path $dllPath.FullName -Destination "$outDir/" -Force
 
       - name: Prepare artifacts (Unix)
         if: matrix.goos != 'windows'
         shell: bash
         run: |
-          mkdir -p artifacts
-          cp -v dist/pub artifacts/pub-${{ matrix.goos }}-${{ matrix.arch }}
-          cp -v dist/sub artifacts/sub-${{ matrix.goos }}-${{ matrix.arch }}
+          out_dir="artifacts/${{ matrix.goos }}-${{ matrix.arch }}"
+          mkdir -p "$out_dir"
+          cp dist/pub "$out_dir/pub"
+          cp dist/sub "$out_dir/sub"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: dist-${{ matrix.goos }}-${{ matrix.arch }}
-          path: artifacts/*
+          path: artifacts/${{ matrix.goos }}-${{ matrix.arch }}
           retention-days: 1
 
   create-release:
@@ -143,19 +127,24 @@ jobs:
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
-          path: artifacts
+          path: artifacts-raw
 
-      - name: Create Release
+      - name: Zip each platform artifact folder
+        run: |
+          mkdir zipped
+          for dir in artifacts-raw/*; do
+            name=$(basename "$dir")
+            zip -r "zipped/${name}.zip" "$dir"
+          done
+
+      - name: Create Release and Upload Zips
         uses: actions/github-script@v7
         with:
           script: |
             const fs = require('fs').promises;
             const path = require('path');
-
-            // Get the tag name from the GitHub ref
             const tagName = context.ref.replace('refs/tags/', '');
 
-            // Create the release
             const release = await github.rest.repos.createRelease({
               owner: context.repo.owner,
               repo: context.repo.repo,
@@ -166,30 +155,13 @@ jobs:
               prerelease: false
             });
 
-            // Helper function to get content type
-            const getContentType = (filename) => {
-              if (filename.endsWith('.exe')) return 'application/x-msdownload';
-              return 'application/octet-stream';
-            };
+            const zipDir = path.resolve(process.env.GITHUB_WORKSPACE, 'zipped');
+            const zipFiles = await fs.readdir(zipDir);
 
-            // Function to recursively get all files
-            async function getFiles(dir) {
-              const entries = await fs.readdir(dir, { withFileTypes: true });
-              const files = await Promise.all(entries.map(async (entry) => {
-                const fullPath = path.join(dir, entry.name);
-                return entry.isDirectory() ? getFiles(fullPath) : fullPath;
-              }));
-              return files.flat();
-            }
-
-            // Upload all artifacts
-            const artifactsDir = path.resolve(process.env.GITHUB_WORKSPACE, 'artifacts');
-            const files = await getFiles(artifactsDir);
-
-            for (const filePath of files) {
+            for (const fileName of zipFiles) {
+              const filePath = path.join(zipDir, fileName);
               const content = await fs.readFile(filePath);
-              const fileName = path.basename(filePath);
-              
+
               await github.rest.repos.uploadReleaseAsset({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
@@ -197,7 +169,7 @@ jobs:
                 name: fileName,
                 data: content,
                 headers: {
-                  'content-type': getContentType(fileName),
+                  'content-type': 'application/zip',
                   'content-length': content.length,
                 },
               });
